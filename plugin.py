@@ -1,12 +1,11 @@
 """OMP Agent 插件 — 基于 maibot-plugin-sdk
 
 为麦麦提供调用宿主机 OMP (AI 编程与系统 Harness) 的能力，
-支持通过 LLM Planner 工具调用（@Tool omp_execute）自主调度，
-以及通过用户前缀命令（@Command /omp）直接交互。
+支持通过用户前缀命令（@Command /omp）直接交互与任务调度。
 """
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
@@ -41,14 +40,24 @@ def _clean_omp_output(raw_text: str) -> str:
     return "\n".join(filtered_lines).strip()
 
 
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础元数据配置。"""
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用 OMP 插件")
+    config_version: str = Field(default="1.0.0", description="配置版本号")
+
+
 class OmpSectionConfig(PluginConfigBase):
     """OMP 执行设置。"""
 
     __ui_label__ = "OMP 设置"
     __ui_icon__ = "terminal"
-    __ui_order__ = 0
+    __ui_order__ = 1
 
-    enabled: bool = Field(default=True, description="是否启用 OMP 插件")
     omp_path: str = Field(
         default="/home/xiang/.bun/bin/omp",
         description="OMP 可执行文件绝对路径",
@@ -71,6 +80,10 @@ class OmpSectionConfig(PluginConfigBase):
         default=True,
         description="是否自动授权工具调用（免交互执行）",
     )
+    save_session: bool = Field(
+        default=True,
+        description="是否保存会话记录以便在终端使用 omp -r 恢复或查看",
+    )
     max_reply_length: int = Field(
         default=1500,
         description="群聊/私聊直接返回的最大字符截断长度",
@@ -80,6 +93,7 @@ class OmpSectionConfig(PluginConfigBase):
 class OmpPluginConfig(PluginConfigBase):
     """OMP 插件顶层配置模型。"""
 
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     omp: OmpSectionConfig = Field(default_factory=OmpSectionConfig)
 
 
@@ -131,6 +145,33 @@ class OmpPlugin(MaiBotPlugin):
 
         return None
 
+    def _find_latest_session(self, start_timestamp: float) -> Optional[str]:
+        """查找在任务执行期间新创建的 OMP 会话 ID。
+
+        Args:
+            start_timestamp: 任务开始执行时的时间戳。
+
+        Returns:
+            Optional[str]: 会话标识 UUID；未找到时返回 None。
+        """
+        try:
+            sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+            if not sessions_root.is_dir():
+                return None
+            candidates = [
+                p
+                for p in sessions_root.glob("*/*.jsonl")
+                if p.stat().st_mtime >= start_timestamp - 1.0
+            ]
+            if not candidates:
+                return None
+            latest = max(candidates, key=lambda p: p.stat().st_mtime)
+            stem = latest.stem
+            return stem.split("_")[-1] if "_" in stem else stem
+        except Exception as exc:
+            logger.debug(f"探测 OMP 会话 ID 失败: {exc}")
+            return None
+
     async def _safe_send_text(self, text: str, stream_id: str) -> bool:
         """安全向指定聊天流发送文本消息。
 
@@ -157,7 +198,7 @@ class OmpPlugin(MaiBotPlugin):
         working_dir: Optional[str] = None,
         model: Optional[str] = None,
         timeout: Optional[int] = None,
-    ) -> Tuple[bool, str, float]:
+    ) -> Tuple[bool, str, float, Optional[str]]:
         """执行 OMP 子进程任务。
 
         Args:
@@ -167,11 +208,11 @@ class OmpPlugin(MaiBotPlugin):
             timeout: 超时时间（秒），缺省使用配置值。
 
         Returns:
-            Tuple[bool, str, float]: (是否成功, 输出或错误内容, 执行耗时秒数)
+            Tuple[bool, str, float, Optional[str]]: (是否成功, 输出或错误内容, 执行耗时秒数, 会话ID)
         """
         omp_binary = self._resolve_omp_binary()
         if not omp_binary:
-            return False, "未找到有效的 OMP 可执行文件，请检查插件配置中的 omp_path", 0.0
+            return False, "未找到有效的 OMP 可执行文件，请检查插件配置中的 omp_path", 0.0, None
 
         target_cwd = (working_dir or "").strip() or (self.effective_config.omp.default_cwd or "").strip()
         sub_cwd: Optional[str] = target_cwd if target_cwd and os.path.isdir(target_cwd) else None
@@ -179,7 +220,9 @@ class OmpPlugin(MaiBotPlugin):
         selected_model = (model or "").strip() or (self.effective_config.omp.default_model or "").strip()
         timeout_seconds = timeout or self.effective_config.omp.timeout_seconds
 
-        cmd: List[str] = [omp_binary, "-p", "--mode", "text", "--no-session"]
+        cmd: List[str] = [omp_binary, "-p", "--mode", "text"]
+        if not self.effective_config.omp.save_session:
+            cmd.append("--no-session")
         if self.effective_config.omp.auto_approve:
             cmd.append("--auto-approve")
         if selected_model:
@@ -188,7 +231,8 @@ class OmpPlugin(MaiBotPlugin):
             cmd.append(f"--cwd={sub_cwd}")
         cmd.append(prompt)
 
-        start_time = time.monotonic()
+        start_monotonic = time.monotonic()
+        start_wall_time = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -197,8 +241,8 @@ class OmpPlugin(MaiBotPlugin):
                 cwd=sub_cwd,
             )
         except Exception as exc:
-            elapsed = time.monotonic() - start_time
-            return False, f"启动 OMP 子进程失败: {exc}", elapsed
+            elapsed = time.monotonic() - start_monotonic
+            return False, f"启动 OMP 子进程失败: {exc}", elapsed, None
 
         try:
             stdout_b, stderr_b = await asyncio.wait_for(
@@ -213,94 +257,24 @@ class OmpPlugin(MaiBotPlugin):
                     proc.kill()
             except ProcessLookupError:
                 pass
-            elapsed = time.monotonic() - start_time
-            return False, f"OMP 执行超时（超过 {timeout_seconds} 秒），任务已中止", elapsed
+            elapsed = time.monotonic() - start_monotonic
+            return False, f"OMP 执行超时（超过 {timeout_seconds} 秒），任务已中止", elapsed, None
 
-        elapsed = time.monotonic() - start_time
+        elapsed = time.monotonic() - start_monotonic
+        session_id = (
+            self._find_latest_session(start_wall_time)
+            if self.effective_config.omp.save_session
+            else None
+        )
         stdout_str = _clean_omp_output(stdout_b.decode("utf-8", errors="replace"))
         stderr_str = _clean_omp_output(stderr_b.decode("utf-8", errors="replace"))
 
         if proc.returncode != 0:
             err_msg = stderr_str or stdout_str or f"OMP 进程异常退出，退出码: {proc.returncode}"
-            return False, err_msg, elapsed
+            return False, err_msg, elapsed, session_id
 
         output = stdout_str or stderr_str or "(执行成功，但无输出内容)"
-        return True, output, elapsed
-
-    # ===== Tool 组件：供麦麦 Planner 推理自主调用 =====
-
-    @Tool(
-        "omp_execute",
-        description=(
-            "调用 OMP (AI 编程与系统 Harness) 执行代码编写、文件检索/修改、环境排查、Git 提交或终端任务。"
-            "当用户要求写代码、修改程序、查找仓库文件、分析错误或执行系统任务时调用此工具。"
-        ),
-        parameters=[
-            ToolParameterInfo(
-                name="task",
-                param_type=ToolParamType.STRING,
-                description="需要让 OMP 执行的具体任务内容或提示词",
-                required=True,
-            ),
-            ToolParameterInfo(
-                name="working_dir",
-                param_type=ToolParamType.STRING,
-                description="任务执行的目标工作目录绝对路径（可选，留空使用插件配置的默认目录）",
-                required=False,
-            ),
-            ToolParameterInfo(
-                name="model",
-                param_type=ToolParamType.STRING,
-                description="指定的模型名称（可选，如 opus, sonnet，留空使用默认模型）",
-                required=False,
-            ),
-        ],
-    )
-    async def handle_omp_execute(
-        self,
-        task: str = "",
-        working_dir: str = "",
-        model: str = "",
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """处理 Planner 对 OMP 的工具调用。"""
-        del kwargs
-
-        if not self.effective_config.omp.enabled:
-            return {
-                "success": False,
-                "error": "OMP 插件当前未启用",
-                "content": "OMP 插件当前未启用",
-            }
-
-        task_content = task.strip()
-        if not task_content:
-            return {
-                "success": False,
-                "error": "任务内容不能为空",
-                "content": "任务内容不能为空",
-            }
-
-        success, output, duration = await self._run_omp_task(
-            prompt=task_content,
-            working_dir=working_dir.strip() or None,
-            model=model.strip() or None,
-        )
-
-        if success:
-            return {
-                "success": True,
-                "output": output,
-                "content": output,
-                "duration": round(duration, 2),
-            }
-        else:
-            return {
-                "success": False,
-                "error": output,
-                "content": f"OMP 执行失败: {output}",
-                "duration": round(duration, 2),
-            }
+        return True, output, elapsed, session_id
 
     # ===== Command 组件：供用户通过 /omp 前缀显式触发 =====
 
@@ -332,8 +306,7 @@ class OmpPlugin(MaiBotPlugin):
                 "🛠️ OMP Agent 插件命令指南：\n"
                 "• /omp <任务描述> : 直接调用宿主机 OMP 执行开发与系统任务\n"
                 "• /omp status : 查看 OMP 可执行文件状态与配置\n"
-                "• /omp help : 显示本帮助指南\n\n"
-                "💡 提示：麦麦已具备自主调度能力，在日常对话中要求写代码或排查问题时，麦麦会自动调用 OMP 工具！"
+                "• /omp help : 显示本帮助指南"
             )
             await self._safe_send_text(help_text, stream_id)
             return True, "已显示帮助信息", True
@@ -343,12 +316,13 @@ class OmpPlugin(MaiBotPlugin):
             omp_path = self._resolve_omp_binary()
             status_lines = [
                 "📊 OMP Agent 状态信息：",
-                f"• 插件启用: {'是' if self.effective_config.omp.enabled else '否'}",
+                f"• 插件启用: {'是' if self.effective_config.plugin.enabled else '否'}",
                 f"• OMP 路径: {omp_path or '未找到有效二进制文件 ❌'}",
                 f"• 默认目录: {self.effective_config.omp.default_cwd}",
                 f"• 默认模型: {self.effective_config.omp.default_model or 'OMP 自身默认'}",
                 f"• 超时时间: {self.effective_config.omp.timeout_seconds} 秒",
                 f"• 自动授权: {'是' if self.effective_config.omp.auto_approve else '否'}",
+                f"• 保存会话: {'是 (支持 omp -r)' if self.effective_config.omp.save_session else '否'}",
                 f"• 最大回复长度: {self.effective_config.omp.max_reply_length} 字",
             ]
             if omp_path:
@@ -369,12 +343,12 @@ class OmpPlugin(MaiBotPlugin):
             return True, "已显示状态信息", True
 
         # 分支 3: 执行具体任务
-        if not self.effective_config.omp.enabled:
+        if not self.effective_config.plugin.enabled:
             err_msg = "❌ OMP 插件当前处于禁用状态，请在配置中开启后再试。"
             await self._safe_send_text(err_msg, stream_id)
             return False, "OMP 插件已禁用", True
 
-        success, output, duration = await self._run_omp_task(prompt=args)
+        success, output, duration, session_id = await self._run_omp_task(prompt=args)
         max_len = self.effective_config.omp.max_reply_length
 
         if success:
@@ -384,11 +358,29 @@ class OmpPlugin(MaiBotPlugin):
                     display_output[:max_len]
                     + f"\n\n... (输出已截断，共 {len(output)} 字，已保留前 {max_len} 字)"
                 )
-            reply_text = f"✨ OMP 执行完成 ({round(duration, 2)}s)：\n\n{display_output}"
+            resume_hint = (
+                f"\n\n📌 会话恢复: omp -r {session_id[:8]}"
+                if session_id
+                else ""
+            )
+            reply_text = (
+                f"✨ OMP 执行完成 ({round(duration, 2)}s)：\n\n"
+                f"{display_output}"
+                f"{resume_hint}"
+            )
             await self._safe_send_text(reply_text, stream_id)
             return True, f"OMP 任务执行成功 ({round(duration, 2)}s)", True
         else:
-            reply_text = f"❌ OMP 执行失败 ({round(duration, 2)}s)：\n\n{output}"
+            resume_hint = (
+                f"\n\n📌 调试会话: omp -r {session_id[:8]}"
+                if session_id
+                else ""
+            )
+            reply_text = (
+                f"❌ OMP 执行失败 ({round(duration, 2)}s)：\n\n"
+                f"{output}"
+                f"{resume_hint}"
+            )
             await self._safe_send_text(reply_text, stream_id)
             return False, f"OMP 执行失败: {output}", True
 

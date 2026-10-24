@@ -3,7 +3,7 @@
   "id": "maibot-team.omp-agent",
   "version": "1.0.0",
   "name": "OMP Agent 插件",
-  "description": "为麦麦提供调用 OMP (AI 编程与系统 Harness) 的能力，支持自主工具调度与直接命令交互",
+  "description": "提供 /omp 显式指令直通调用宿主机 OMP 执行代码与开发任务，严格指令驱动，禁止自主调用",
   "author": {
     "name": "MaiBot开发团队",
     "url": "https://github.com/MaiM-with-u"
