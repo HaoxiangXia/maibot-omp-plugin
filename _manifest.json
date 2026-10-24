@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "id": "maibot-team.omp-agent",
+  "version": "1.0.0",
+  "name": "OMP Agent 插件",
+  "description": "为麦麦提供调用 OMP (AI 编程与系统 Harness) 的能力，支持自主工具调度与直接命令交互",
+  "author": {
+    "name": "MaiBot开发团队",
+    "url": "https://github.com/MaiM-with-u"
+  },
+  "license": "GPL-v3.0-or-later",
+  "urls": {
+    "repository": "https://github.com/MaiM-with-u/maibot"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "999.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "config.get"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
