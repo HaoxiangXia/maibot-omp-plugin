@@ -80,9 +80,9 @@ class OmpSectionConfig(PluginConfigBase):
         description="指定使用的模型名称（留空使用 OMP 自身当前默认配置）",
     )
     timeout_seconds: int = Field(
-        default=180,
+        default=300,
         ge=10,
-        le=600,
+        le=900,
         description="单次执行最大超时时间（秒）",
     )
     auto_approve: bool = Field(
@@ -298,6 +298,9 @@ class OmpPlugin(MaiBotPlugin):
             cmd.append("--auto-approve")
         if selected_model:
             cmd.append(f"--model={selected_model}")
+        cmd.append(
+            "--append-system-prompt=【执行准则】请在完成指定的开发、修改或查询任务后直接给出清晰的最终结论，避免冗余的背景调研或反复调用次级工具。"
+        )
         cmd.append(f"--cwd={workspace_path}")
         cmd.append(prompt)
 
@@ -352,6 +355,7 @@ class OmpPlugin(MaiBotPlugin):
         "omp",
         description="直接下发任务给 OMP 执行或查询 OMP 运行状态",
         pattern=r"^/omp(?:\s+(?P<args>.*))?$",
+        timeout_ms=360000,
     )
     async def handle_omp(
         self,
@@ -421,6 +425,8 @@ class OmpPlugin(MaiBotPlugin):
             err_msg = "❌ OMP 插件当前处于禁用状态，请在配置中开启后再试。"
             await self._safe_send_text(err_msg, stream_id)
             return False, "OMP 插件已禁用", True
+
+        await self._safe_send_text("⏳ OMP 任务已启动，正在沙盒中执行，请稍候...", stream_id)
 
         success, output, duration, session_id = await self._run_omp_task(prompt=args)
         max_len = self.effective_config.omp.max_reply_length
