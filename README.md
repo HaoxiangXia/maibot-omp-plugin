@@ -10,6 +10,9 @@
   - **全系统强制只读**：宿主机根目录、系统二进制、依赖库和主目录默认全盘只读（只读保护，禁止任何写、改、删）。
   - **唯一可写工作区**：仅有 `data/omp_workspace/` 目录允许写入和修改，防止篡改 MaiBot 自身文件或宿主机系统。
   - **隐私目录遮蔽**：`~/.ssh`、`~/.gnupg` 挂载为空白内存盘，防止私钥等凭据泄露。
+- **长时间任务状态跟踪**：
+  - 下发命令后立即回执 `⏳ OMP 任务已启动，正在沙盒中执行，请稍候...`；
+  - 若任务执行超过 5 分钟，Bot 会向聊天流主动发送进度提醒（`⏳ OMP 任务仍在进行中（已执行 5 分钟），正在沙盒中继续处理，请耐心等待...`），OMP 保持继续执行不中断。
 
 ## 指令使用方法
 - `/omp <任务内容>`：在隔离沙盒中向宿主机 OMP 下发执行任务并等待回传输出（例如 `/omp 写一个猜数字的小游戏`）。
@@ -39,10 +42,10 @@
 - `plugin.enabled` (bool): 插件全局开关，默认 `true`
 - `omp.use_sandbox` (bool): 是否启用 Bubblewrap 沙盒强隔离，默认 `true`
 - `omp.bwrap_path` (str): Bubblewrap (bwrap) 可执行文件绝对路径，默认 `/usr/bin/bwrap`
-- `omp.omp_path` (str): OMP 二进制文件绝对路径，默认 `/home/xiang/.bun/bin/omp`
 - `omp.default_cwd` (str): 沙盒内唯一可写工作空间目录，默认 `/home/xiang/MaiBot/data/omp_workspace`
-- `omp.default_model` (str): 指定模型（留空使用 OMP 自身当前默认配置）
-- `omp.timeout_seconds` (int): 单次任务最大超时时间（秒），默认 `180`
+- `omp.default_model` (str): 指定模型，默认 `gemini-3.8-flash`
+- `omp.progress_notify_seconds` (int): 超过该时长未结束时主动发送进度提醒（秒），默认 `300`（5分钟）
+- `omp.timeout_seconds` (int): 单次任务最大硬超时时间（秒），默认 `900`（15分钟）
 - `omp.auto_approve` (bool): 是否免交互自动授权工具调用，默认 `true`
 - `omp.save_session` (bool): 是否保存会话记录以便后续 resume，默认 `true`
 - `omp.max_reply_length` (int): 消息最大截断长度，默认 `1500`

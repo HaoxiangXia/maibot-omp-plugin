@@ -76,14 +76,20 @@ class OmpSectionConfig(PluginConfigBase):
         description="默认工作空间目录绝对路径（沙盒内唯一可写工作目录）",
     )
     default_model: str = Field(
-        default="",
-        description="指定使用的模型名称（留空使用 OMP 自身当前默认配置）",
+        default="gemini-3.8-flash",
+        description="指定使用的模型名称（默认使用 gemini-3.8-flash）",
+    )
+    progress_notify_seconds: int = Field(
+        default=300,
+        ge=30,
+        le=3600,
+        description="执行超过该时长未结束时向聊天流发送进度告知（秒，默认 5 分钟）",
     )
     timeout_seconds: int = Field(
-        default=300,
-        ge=10,
-        le=900,
-        description="单次执行最大超时时间（秒）",
+        default=900,
+        ge=60,
+        le=3600,
+        description="单次执行最大硬超时时间（秒，默认 15 分钟）",
     )
     auto_approve: bool = Field(
         default=True,
@@ -232,6 +238,7 @@ class OmpPlugin(MaiBotPlugin):
         working_dir: Optional[str] = None,
         model: Optional[str] = None,
         timeout: Optional[int] = None,
+        stream_id: str = "",
     ) -> Tuple[bool, str, float, Optional[str]]:
         """执行 OMP 子进程任务。内置 Bubblewrap 沙盒隔离。
 
@@ -298,9 +305,6 @@ class OmpPlugin(MaiBotPlugin):
             cmd.append("--auto-approve")
         if selected_model:
             cmd.append(f"--model={selected_model}")
-        cmd.append(
-            "--append-system-prompt=【执行准则】请在完成指定的开发、修改或查询任务后直接给出清晰的最终结论，避免冗余的背景调研或反复调用次级工具。"
-        )
         cmd.append(f"--cwd={workspace_path}")
         cmd.append(prompt)
 
@@ -317,12 +321,43 @@ class OmpPlugin(MaiBotPlugin):
             elapsed = time.monotonic() - start_monotonic
             return False, f"启动 OMP 子进程失败: {exc}", elapsed, None
 
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=float(timeout_seconds),
+        communicate_task = asyncio.create_task(proc.communicate())
+        notified_progress = False
+        progress_notify_sec = float(self.effective_config.omp.progress_notify_seconds)
+        hard_timeout_sec = float(timeout_seconds)
+
+        stdout_b = b""
+        stderr_b = b""
+        timed_out = False
+
+        while True:
+            elapsed_current = time.monotonic() - start_monotonic
+            remaining_total = hard_timeout_sec - elapsed_current
+            if remaining_total <= 0:
+                timed_out = True
+                break
+
+            wait_slice = (
+                min(progress_notify_sec, remaining_total)
+                if not notified_progress
+                else remaining_total
             )
-        except asyncio.TimeoutError:
+
+            done, _ = await asyncio.wait([communicate_task], timeout=wait_slice)
+            if communicate_task in done:
+                stdout_b, stderr_b = communicate_task.result()
+                break
+
+            # 超过设定时间（默认 5 分钟）尚未结束时通知用户，任务继续在沙盒中执行
+            if not notified_progress and (time.monotonic() - start_monotonic) >= progress_notify_sec:
+                notified_progress = True
+                elapsed_minutes = max(1, int((time.monotonic() - start_monotonic) // 60))
+                await self._safe_send_text(
+                    f"⏳ OMP 任务仍在进行中（已执行 {elapsed_minutes} 分钟），正在沙盒中继续处理，请耐心等待...",
+                    stream_id,
+                )
+
+        if timed_out:
             try:
                 proc.terminate()
                 await asyncio.sleep(0.5)
@@ -355,7 +390,7 @@ class OmpPlugin(MaiBotPlugin):
         "omp",
         description="直接下发任务给 OMP 执行或查询 OMP 运行状态",
         pattern=r"^/omp(?:\s+(?P<args>.*))?$",
-        timeout_ms=360000,
+        timeout_ms=1200000,
     )
     async def handle_omp(
         self,
@@ -428,7 +463,7 @@ class OmpPlugin(MaiBotPlugin):
 
         await self._safe_send_text("⏳ OMP 任务已启动，正在沙盒中执行，请稍候...", stream_id)
 
-        success, output, duration, session_id = await self._run_omp_task(prompt=args)
+        success, output, duration, session_id = await self._run_omp_task(prompt=args, stream_id=stream_id)
         max_len = self.effective_config.omp.max_reply_length
 
         if success:
