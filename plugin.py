@@ -11,11 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import re
 import shutil
 import time
+from datetime import datetime
 
 logger = logging.getLogger("maibot.plugins.omp_agent")
 
@@ -217,6 +219,106 @@ class OmpPlugin(MaiBotPlugin):
             logger.debug(f"探测 OMP 会话 ID 失败: {exc}")
             return None
 
+    def _list_recent_sessions(self, limit: int = 5) -> List[Dict[str, str]]:
+        """列出最近的 OMP 会话概要。
+
+        Args:
+            limit: 最多返回的会话数量。
+
+        Returns:
+            List[Dict[str, str]]: 每项包含 session_id、updated_at 与 summary。
+        """
+        sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+        if not sessions_root.is_dir():
+            return []
+
+        try:
+            jsonls = sorted(
+                sessions_root.glob("*/*.jsonl"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )[:limit]
+        except Exception as exc:
+            logger.debug(f"列出会话目录失败: {exc}")
+            return []
+
+        results: List[Dict[str, str]] = []
+        for jsonl in jsonls:
+            stem = jsonl.stem
+            session_id = stem.split("_")[-1] if "_" in stem else stem
+            try:
+                updated_at = datetime.fromtimestamp(jsonl.stat().st_mtime).strftime("%m-%d %H:%M")
+            except OSError:
+                updated_at = "-"
+            results.append(
+                {
+                    "session_id": session_id,
+                    "updated_at": updated_at,
+                    "summary": self._extract_session_prompt(jsonl),
+                }
+            )
+        return results
+
+    @staticmethod
+    def _extract_session_prompt(session_jsonl: Path) -> str:
+        """从会话记录中提取首条用户提示词作为概要。
+
+        Args:
+            session_jsonl: 会话记录文件路径。
+
+        Returns:
+            str: 首条用户提示词摘要；无法解析时返回空字符串。
+        """
+        try:
+            with session_jsonl.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if data.get("type") != "message":
+                        continue
+                    message = data.get("message")
+                    if not isinstance(message, dict) or message.get("role") != "user":
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        return content.strip()
+                    if isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                return str(item.get("text") or "").strip()
+                    return ""
+        except Exception as exc:
+            logger.debug(f"解析会话概要失败: {exc}")
+        return ""
+
+    def _match_session_id(self, key: str, recent_sessions: List[Dict[str, str]]) -> Optional[str]:
+        """根据序号或 ID 前缀匹配目标会话 ID。
+
+        Args:
+            key: 用户输入的序号或会话 ID 片段。
+            recent_sessions: 最近的会话列表。
+
+        Returns:
+            Optional[str]: 匹配到的会话 ID；未匹配时返回 None。
+        """
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            return None
+
+        if clean_key.isdigit():
+            index = int(clean_key)
+            if 1 <= index <= len(recent_sessions):
+                return recent_sessions[index - 1]["session_id"]
+            return None
+
+        lowered = clean_key.lower()
+        for session in recent_sessions:
+            if session["session_id"].lower().startswith(lowered):
+                return session["session_id"]
+        return None
+
     async def _safe_send_text(self, text: str, stream_id: str) -> bool:
         """安全向指定聊天流发送文本消息。
 
@@ -402,6 +504,7 @@ class OmpPlugin(MaiBotPlugin):
         model: Optional[str] = None,
         timeout: Optional[int] = None,
         stream_id: str = "",
+        resume_session_id: Optional[str] = None,
     ) -> Tuple[bool, str, float, Optional[str]]:
         """执行 OMP 子进程任务。内置 Bubblewrap 沙盒隔离。
 
@@ -410,6 +513,8 @@ class OmpPlugin(MaiBotPlugin):
             working_dir: 任务执行工作目录，缺省使用配置中的默认目录。
             model: 模型名称覆盖，缺省使用配置或 OMP 默认模型。
             timeout: 超时时间（秒），缺省使用配置值。
+            stream_id: 聊天流标识，用于发送进度通知。
+            resume_session_id: 需要延续的历史会话 ID，缺省表示新建会话。
 
         Returns:
             Tuple[bool, str, float, Optional[str]]: (是否成功, 输出或错误内容, 执行耗时秒数, 会话ID)
@@ -468,6 +573,8 @@ class OmpPlugin(MaiBotPlugin):
             cmd.append("--auto-approve")
         if selected_model:
             cmd.append(f"--model={selected_model}")
+        if resume_session_id:
+            cmd.append(f"--resume={resume_session_id}")
         cmd.append(f"--cwd={workspace_path}")
         cmd.append(prompt)
 
@@ -486,7 +593,19 @@ class OmpPlugin(MaiBotPlugin):
             return False, f"启动 OMP 子进程失败: {exc}", elapsed, None
 
         # 确认子进程已成功生成并在后台运行，再发送启动回执
-        await self._safe_send_text("⏳ OMP 任务已启动，正在沙盒中执行，请稍候...", stream_id)
+        preview_prompt = prompt.strip().replace("\n", " ")
+        if len(preview_prompt) > 60:
+            preview_prompt = preview_prompt[:60] + "..."
+        start_lines = [
+            "⏳ OMP 任务已在沙盒中启动...",
+            f"• 目标模型: {selected_model or 'OMP 自身默认'}",
+            f"• 工作目录: {workspace_path}",
+        ]
+        if resume_session_id:
+            start_lines.append(f"• 已恢复会话: {resume_session_id[:8]}")
+        start_lines.append(f"• 任务指令: {preview_prompt}")
+        start_lines.append("正在处理中，请稍候。")
+        await self._safe_send_text("\n".join(start_lines), stream_id)
 
         communicate_task = asyncio.create_task(proc.communicate())
         notified_progress = False
@@ -520,7 +639,8 @@ class OmpPlugin(MaiBotPlugin):
                 notified_progress = True
                 elapsed_minutes = max(1, int((time.monotonic() - start_monotonic) // 60))
                 await self._safe_send_text(
-                    f"⏳ OMP 任务仍在进行中（已执行 {elapsed_minutes} 分钟），正在沙盒中继续处理，请耐心等待...",
+                    f"⏳ OMP 任务仍在进行中（已执行 {elapsed_minutes} 分钟）...\n"
+                    "正在沙盒中继续分析与处理，未中断。执行完成后将自动发送最终结果与 HTML 网页，请耐心等待。",
                     stream_id,
                 )
 
@@ -536,11 +656,15 @@ class OmpPlugin(MaiBotPlugin):
             return False, f"OMP 执行超时（超过 {timeout_seconds} 秒），任务已中止", elapsed, None
 
         elapsed = time.monotonic() - start_monotonic
-        session_id = (
-            self._find_latest_session(start_wall_time)
-            if self.effective_config.omp.save_session
-            else None
-        )
+        if resume_session_id:
+            # 延续历史会话时，OMP 会复用原会话文件，ID 保持不变
+            session_id = resume_session_id
+        else:
+            session_id = (
+                self._find_latest_session(start_wall_time)
+                if self.effective_config.omp.save_session
+                else None
+            )
         stdout_str = _clean_omp_output(stdout_b.decode("utf-8", errors="replace"))
         stderr_str = _clean_omp_output(stderr_b.decode("utf-8", errors="replace"))
 
@@ -550,6 +674,67 @@ class OmpPlugin(MaiBotPlugin):
 
         output = stdout_str or stderr_str or "(执行成功，但无输出内容)"
         return True, output, elapsed, session_id
+
+    async def _reply_task_result(
+        self,
+        success: bool,
+        output: str,
+        duration: float,
+        session_id: Optional[str],
+        stream_id: str,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> Tuple[bool, Optional[str], bool]:
+        """回传任务执行结果，并按需附带 HTML 交互网页文件。
+
+        Args:
+            success: 任务是否执行成功。
+            output: 任务输出或错误信息。
+            duration: 任务执行耗时（秒）。
+            session_id: 关联的 OMP 会话 ID。
+            stream_id: 聊天流标识。
+            group_id: 群号（如果是群聊）。
+            user_id: 用户 QQ 号。
+
+        Returns:
+            Tuple[bool, Optional[str], bool]: 命令执行结果三元组。
+        """
+        max_len = self.effective_config.omp.max_reply_length
+        display_output = output
+        if len(display_output) > max_len:
+            display_output = (
+                display_output[:max_len]
+                + f"\n\n... (输出已截断，共 {len(output)} 字，已保留前 {max_len} 字)"
+            )
+
+        if success:
+            resume_hint = f"\n\n📌 终端恢复: omp -r {session_id[:8]}" if session_id else ""
+            reply_text = (
+                f"✨ OMP 任务执行完成 (耗时: {round(duration, 2)}s)\n\n"
+                f"【执行结果】\n{display_output}{resume_hint}"
+            )
+            await self._safe_send_text(reply_text, stream_id)
+        else:
+            resume_hint = f"\n\n📌 会话调试: omp -r {session_id[:8]}" if session_id else ""
+            reply_text = (
+                f"❌ OMP 任务执行失败 (耗时: {round(duration, 2)}s)\n\n"
+                f"【失败信息】\n{display_output}{resume_hint}"
+            )
+            await self._safe_send_text(reply_text, stream_id)
+
+        # 使用 OMP 内置的 --export 功能将结果转换为 HTML 网页文件并发送
+        if success and self.effective_config.omp.export_html and session_id:
+            html_path = await self._export_session_to_html(session_id)
+            if html_path:
+                sent = await self._safe_send_file(
+                    html_path, stream_id, group_id=group_id, user_id=user_id
+                )
+                if not sent:
+                    await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
+
+        if success:
+            return True, f"OMP 任务执行成功 ({round(duration, 2)}s)", True
+        return False, f"OMP 执行失败: {output}", True
 
     # ===== Command 组件：供用户通过 /omp 前缀显式触发 =====
 
@@ -582,25 +767,93 @@ class OmpPlugin(MaiBotPlugin):
         # 分支 1: 帮助信息
         if not args or args in {"help", "-h", "--help"}:
             help_text = (
-                "🛠️ OMP Agent 插件命令指南：\n"
-                "• /omp <任务描述> : 在隔离沙盒中调用宿主机 OMP 执行任务（完成后自动导出并发送交互网页）\n"
-                "• /omp export : 将最近一次 OMP 会话导出为 HTML 网页文件并发送\n"
-                "• /omp status : 查看 OMP 可执行文件状态、沙盒隔离与配置\n"
-                "• /omp help : 显示本帮助指南\n\n"
-                "🛡️ 安全防护：插件已开启 Bubblewrap 内核沙盒隔离，仅 data/omp_workspace/ 目录允许写入，系统其它目录全盘只读。"
+                "🛠️ OMP Agent 指令指南\n\n"
+                "【基础指令】\n"
+                "• /omp <任务描述>                 向 OMP 下发开发任务（沙盒执行，完成后回传 HTML 交互网页）\n"
+                "• /omp resume                     列出最近 5 个历史会话，可选择继续沿某一个会话深入对话\n"
+                "• /omp resume <序号/ID> <内容>     沿用指定的历史会话继续提问或写代码\n"
+                "• /omp export                     导出最近一次会话为交互式 HTML 网页并发送\n"
+                "• /omp status                     查看核心运行环境与当前模型\n"
+                "• /omp help                       显示本帮助信息\n\n"
+                "【常用示例】\n"
+                "• /omp 写一个带样式的待办事项网页 demo\n"
+                "• /omp resume 1 在刚才生成的网页上加一个本地持久化存储功能\n\n"
+                "🛡️ 运行环境与安全策略：\n"
+                "- 内核级 Bubblewrap 沙盒强隔离，全盘强制只读保护。\n"
+                "- 唯一可写工作空间：data/omp_workspace/\n"
+                "- 敏感凭据目录（~/.ssh, ~/.gnupg）自动盲区遮蔽。"
             )
             await self._safe_send_text(help_text, stream_id)
             return True, "已显示帮助信息", True
 
-        # 分支 2: 手动导出最近会话为 HTML 网页
+        # 分支 2: 会话检索与延续
+        if args == "resume" or args.startswith("resume "):
+            recent_sessions = self._list_recent_sessions(limit=5)
+            if not recent_sessions:
+                await self._safe_send_text("⚠️ 暂无可用的 OMP 历史会话，请先执行一次 /omp 任务。", stream_id)
+                return False, "未找到会话", True
+
+            resume_args = args[len("resume") :].strip()
+            if not resume_args:
+                list_lines = [f"📋 最近 {len(recent_sessions)} 个 OMP 会话列表：", ""]
+                for index, session in enumerate(recent_sessions, 1):
+                    summary = session["summary"] or "(无提示词记录)"
+                    if len(summary) > 45:
+                        summary = summary[:45] + "..."
+                    list_lines.append(f"[{index}] {session['session_id'][:8]} | {session['updated_at']}")
+                    list_lines.append(f'    💬 "{summary}"')
+                    list_lines.append("")
+                list_lines.append("👉 如何继续对话：")
+                list_lines.append("发送：/omp resume <序号或ID> <新任务/继续说明>")
+                list_lines.append("例如：/omp resume 1 帮我在这个基础上再增加一个导出按钮")
+                list_lines.append("或者：/omp resume 01a16e73 帮我在这个基础上再增加一个导出按钮")
+                await self._safe_send_text("\n".join(list_lines), stream_id)
+                return True, "已列出会话列表", True
+
+            resume_parts = resume_args.split(maxsplit=1)
+            resume_key = resume_parts[0]
+            resume_prompt = resume_parts[1].strip() if len(resume_parts) > 1 else ""
+            if not resume_prompt:
+                await self._safe_send_text(
+                    "⚠️ 请在会话标识后补充要继续的内容。\n"
+                    "例如：/omp resume 1 在刚才生成的网页上加一个本地持久化存储功能",
+                    stream_id,
+                )
+                return False, "缺少续写内容", True
+
+            target_session_id = self._match_session_id(resume_key, recent_sessions)
+            if not target_session_id:
+                await self._safe_send_text(
+                    f"⚠️ 未找到匹配的会话：{resume_key}\n"
+                    "请先发送 /omp resume 查看最近 5 个会话列表。",
+                    stream_id,
+                )
+                return False, "未找到会话", True
+
+            success, output, duration, session_id = await self._run_omp_task(
+                prompt=resume_prompt,
+                stream_id=stream_id,
+                resume_session_id=target_session_id,
+            )
+            return await self._reply_task_result(
+                success=success,
+                output=output,
+                duration=duration,
+                session_id=session_id,
+                stream_id=stream_id,
+                group_id=raw_group_id,
+                user_id=raw_user_id,
+            )
+
+        # 分支 3: 手动导出最近会话为 HTML 网页
         if args == "export":
             sessions_root = Path.home() / ".omp" / "agent" / "sessions"
             if not sessions_root.is_dir():
-                await self._safe_send_text("❌ 未找到任何 OMP 历史会话", stream_id)
+                await self._safe_send_text("⚠️ 暂无可导出的 OMP 历史会话，请先执行一次 /omp 任务。", stream_id)
                 return False, "未找到会话", True
             jsonls = list(sessions_root.glob("*/*.jsonl"))
             if not jsonls:
-                await self._safe_send_text("❌ 未找到任何 OMP 历史会话", stream_id)
+                await self._safe_send_text("⚠️ 暂无可导出的 OMP 历史会话，请先执行一次 /omp 任务。", stream_id)
                 return False, "未找到会话", True
             latest_session = max(jsonls, key=lambda p: p.stat().st_mtime)
             stem = latest_session.stem
@@ -610,30 +863,25 @@ class OmpPlugin(MaiBotPlugin):
                 sent = await self._safe_send_file(
                     html_path, stream_id, group_id=raw_group_id, user_id=raw_user_id
                 )
-                if not sent:
+                if sent:
+                    await self._safe_send_text(
+                        "📄 交互式网页文件已上传完成！\n"
+                        f"• 文件名: {html_path.name}\n"
+                        f"• 本地路径: {html_path}\n"
+                        "💡 提示：点击聊天中的文件即可在浏览器离线查看完整代码高亮、思考过程与工具调用。",
+                        stream_id,
+                    )
+                else:
                     await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
                 return True, "已导出并发送 HTML 文件", True
             else:
                 await self._safe_send_text("❌ 导出 HTML 文件失败", stream_id)
                 return False, "导出失败", True
 
-        # 分支 3: 查看状态
+        # 分支 4: 查看核心运行环境
         if args == "status":
             omp_path = self._resolve_omp_binary()
-            bwrap_path = self._resolve_bwrap_binary()
-            sandbox_active = self.effective_config.omp.use_sandbox and bool(bwrap_path)
-            status_lines = [
-                "📊 OMP Agent 状态信息：",
-                f"• 插件启用: {'是' if self.effective_config.plugin.enabled else '否'}",
-                f"• 沙盒隔离: {'已开启 🛡️ (Bubblewrap / 仅 workspace 可写，全盘只读)' if sandbox_active else '未开启 ⚠️'}",
-                f"• OMP 路径: {omp_path or '未找到有效二进制文件 ❌'}",
-                f"• 沙盒工作空间: {self.effective_config.omp.default_cwd}",
-                f"• 默认模型: {self.effective_config.omp.default_model or 'OMP 自身默认'}",
-                f"• 超时时间: {self.effective_config.omp.timeout_seconds} 秒",
-                f"• 自动授权: {'是' if self.effective_config.omp.auto_approve else '否'}",
-                f"• 保存会话: {'是 (支持 omp -r)' if self.effective_config.omp.save_session else '否'}",
-                f"• 最大回复长度: {self.effective_config.omp.max_reply_length} 字",
-            ]
+            version_text = "未知版本"
             if omp_path:
                 try:
                     probe_proc = await asyncio.create_subprocess_exec(
@@ -643,67 +891,41 @@ class OmpPlugin(MaiBotPlugin):
                         stderr=asyncio.subprocess.PIPE,
                     )
                     v_out, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=5.0)
-                    version_text = _clean_omp_output(v_out.decode("utf-8", errors="replace"))
-                    status_lines.append(f"• OMP 版本: {version_text}")
+                    raw_version = _clean_omp_output(v_out.decode("utf-8", errors="replace"))
+                    if raw_version:
+                        version_text = raw_version.replace("omp/", "v").strip()
                 except Exception as exc:
-                    status_lines.append(f"• 版本检测失败: {exc}")
-            status_text = "\n".join(status_lines)
+                    logger.debug(f"探测 OMP 版本失败: {exc}")
+
+            status_text = "\n".join(
+                [
+                    "📊 OMP Agent 运行状态",
+                    "",
+                    "【核心环境】",
+                    f"• 插件状态: {'运行中 (Enabled)' if self.effective_config.plugin.enabled else '已停用 (Disabled)'}",
+                    f"• OMP 引擎: {omp_path or '未找到有效二进制文件 ❌'} ({version_text})",
+                    f"• 默认模型: {self.effective_config.omp.default_model or 'OMP 自身默认'}",
+                ]
+            )
             await self._safe_send_text(status_text, stream_id)
             return True, "已显示状态信息", True
 
-        # 分支 3: 执行具体任务
+        # 分支 5: 执行具体任务
         if not self.effective_config.plugin.enabled:
             err_msg = "❌ OMP 插件当前处于禁用状态，请在配置中开启后再试。"
             await self._safe_send_text(err_msg, stream_id)
             return False, "OMP 插件已禁用", True
 
-
         success, output, duration, session_id = await self._run_omp_task(prompt=args, stream_id=stream_id)
-        max_len = self.effective_config.omp.max_reply_length
-
-        if success:
-            display_output = output
-            if len(display_output) > max_len:
-                display_output = (
-                    display_output[:max_len]
-                    + f"\n\n... (输出已截断，共 {len(output)} 字，已保留前 {max_len} 字)"
-                )
-            resume_hint = (
-                f"\n\n📌 会话恢复: omp -r {session_id[:8]}"
-                if session_id
-                else ""
-            )
-            reply_text = (
-                f"✨ OMP 执行完成 ({round(duration, 2)}s)：\n\n"
-                f"{display_output}"
-                f"{resume_hint}"
-            )
-            await self._safe_send_text(reply_text, stream_id)
-
-            # 使用 OMP 内置的 --export 功能将结果转换为 HTML 网页文件并发送
-            if self.effective_config.omp.export_html and session_id:
-                html_path = await self._export_session_to_html(session_id)
-                if html_path:
-                    sent = await self._safe_send_file(
-                        html_path, stream_id, group_id=raw_group_id, user_id=raw_user_id
-                    )
-                    if not sent:
-                        await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
-
-            return True, f"OMP 任务执行成功 ({round(duration, 2)}s)", True
-        else:
-            resume_hint = (
-                f"\n\n📌 调试会话: omp -r {session_id[:8]}"
-                if session_id
-                else ""
-            )
-            reply_text = (
-                f"❌ OMP 执行失败 ({round(duration, 2)}s)：\n\n"
-                f"{output}"
-                f"{resume_hint}"
-            )
-            await self._safe_send_text(reply_text, stream_id)
-            return False, f"OMP 执行失败: {output}", True
+        return await self._reply_task_result(
+            success=success,
+            output=output,
+            duration=duration,
+            session_id=session_id,
+            stream_id=stream_id,
+            group_id=raw_group_id,
+            user_id=raw_user_id,
+        )
 
     # ===== 插件生命周期钩子 =====
 
