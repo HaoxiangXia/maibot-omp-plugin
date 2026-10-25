@@ -708,10 +708,11 @@ class OmpPlugin(MaiBotPlugin):
             )
 
         if success:
-            resume_hint = f"\n\n📌 终端恢复: omp -r {session_id[:8]}" if session_id else ""
+            resume_hint = f"\n📌 终端恢复: omp -r {session_id[:8]}" if session_id else ""
             reply_text = (
-                f"✨ OMP 任务执行完成 (耗时: {round(duration, 2)}s)\n\n"
-                f"【执行结果】\n{display_output}{resume_hint}"
+                f"✨ OMP 任务执行成功 (耗时: {round(duration, 2)}s)\n"
+                "📄 任务详情、完整代码与思考过程请查看下方 HTML 交互网页。"
+                f"{resume_hint}"
             )
             await self._safe_send_text(reply_text, stream_id)
         else:
