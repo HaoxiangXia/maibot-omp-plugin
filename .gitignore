@@ -1,4 +1,10 @@
 __pycache__/
 *.pyc
+*.pyo
 config.toml
 .pytest_cache/
+.venv/
+venv/
+
+# 插件运行时生成的会话导出文件
+omp-session-*.html
