@@ -99,6 +99,10 @@ class OmpSectionConfig(PluginConfigBase):
         default=True,
         description="是否保存会话记录以便在终端使用 omp -r 恢复或查看",
     )
+    export_html: bool = Field(
+        default=True,
+        description="任务完成后是否使用 OMP 内置的 --export 功能将结果导出为 HTML 网页文件并发送",
+    )
     max_reply_length: int = Field(
         default=1500,
         description="群聊/私聊直接返回的最大字符截断长度",
@@ -231,6 +235,88 @@ class OmpPlugin(MaiBotPlugin):
         except Exception as exc:
             logger.error(f"向聊天流 {stream_id} 发送消息失败: {exc}", exc_info=True)
         return False
+
+    async def _safe_send_file(self, file_path: Path, stream_id: str) -> bool:
+        """安全向指定聊天流发送文件。
+
+        Args:
+            file_path: 目标文件路径。
+            stream_id: 聊天流标识。
+
+        Returns:
+            bool: 发送是否成功。
+        """
+        if not stream_id or not file_path.is_file():
+            return False
+        try:
+            if hasattr(self, "_ctx") and self._ctx is not None:
+                payload = {
+                    "file": str(file_path.resolve()),
+                    "name": file_path.name,
+                }
+                return bool(await self.ctx.send.custom("file", payload, stream_id))
+        except Exception as exc:
+            logger.error(f"向聊天流 {stream_id} 发送文件失败: {exc}", exc_info=True)
+        return False
+
+    async def _export_session_to_html(self, session_id: str) -> Optional[Path]:
+        """使用 OMP 内置的 --export 功能将指定会话导出为独立 HTML 文件。
+
+        Args:
+            session_id: 会话标识。
+
+        Returns:
+            Optional[Path]: 导出的 HTML 文件绝对路径；失败时返回 None。
+        """
+        omp_binary = self._resolve_omp_binary()
+        if not omp_binary or not session_id:
+            return None
+
+        sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+        if not sessions_root.is_dir():
+            return None
+
+        matched_files = list(sessions_root.glob(f"*/*{session_id}*.jsonl"))
+        if not matched_files:
+            return None
+
+        session_jsonl = matched_files[0]
+        workspace_path = Path(self.effective_config.omp.default_cwd).resolve()
+        workspace_path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                omp_binary,
+                f"--export={session_jsonl}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(workspace_path),
+            )
+            stdout_b, stderr_b = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    f"OMP 导出 HTML 失败 (code {proc.returncode}): {stderr_b.decode('utf-8', errors='replace')}"
+                )
+                return None
+
+            stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
+            for line in stdout_text.splitlines():
+                if "Exported to:" in line:
+                    file_name = line.split("Exported to:", 1)[1].strip()
+                    target_file = workspace_path / file_name
+                    if target_file.is_file():
+                        return target_file
+
+            html_candidates = [
+                p for p in workspace_path.glob("omp-session-*.html") if session_id in p.name
+            ]
+            if html_candidates:
+                return max(html_candidates, key=lambda p: p.stat().st_mtime)
+        except Exception as exc:
+            logger.error(f"导出 OMP HTML 发生异常: {exc}", exc_info=True)
+
+        return None
+
 
     async def _run_omp_task(
         self,
@@ -417,7 +503,8 @@ class OmpPlugin(MaiBotPlugin):
         if not args or args in {"help", "-h", "--help"}:
             help_text = (
                 "🛠️ OMP Agent 插件命令指南：\n"
-                "• /omp <任务描述> : 在隔离沙盒中调用宿主机 OMP 执行开发与系统任务\n"
+                "• /omp <任务描述> : 在隔离沙盒中调用宿主机 OMP 执行任务（完成后自动导出并发送交互网页）\n"
+                "• /omp export : 将最近一次 OMP 会话导出为 HTML 网页文件并发送\n"
                 "• /omp status : 查看 OMP 可执行文件状态、沙盒隔离与配置\n"
                 "• /omp help : 显示本帮助指南\n\n"
                 "🛡️ 安全防护：插件已开启 Bubblewrap 内核沙盒隔离，仅 data/omp_workspace/ 目录允许写入，系统其它目录全盘只读。"
@@ -425,7 +512,30 @@ class OmpPlugin(MaiBotPlugin):
             await self._safe_send_text(help_text, stream_id)
             return True, "已显示帮助信息", True
 
-        # 分支 2: 查看状态
+        # 分支 2: 手动导出最近会话为 HTML 网页
+        if args == "export":
+            sessions_root = Path.home() / ".omp" / "agent" / "sessions"
+            if not sessions_root.is_dir():
+                await self._safe_send_text("❌ 未找到任何 OMP 历史会话", stream_id)
+                return False, "未找到会话", True
+            jsonls = list(sessions_root.glob("*/*.jsonl"))
+            if not jsonls:
+                await self._safe_send_text("❌ 未找到任何 OMP 历史会话", stream_id)
+                return False, "未找到会话", True
+            latest_session = max(jsonls, key=lambda p: p.stat().st_mtime)
+            stem = latest_session.stem
+            latest_id = stem.split("_")[-1] if "_" in stem else stem
+            html_path = await self._export_session_to_html(latest_id)
+            if html_path:
+                sent = await self._safe_send_file(html_path, stream_id)
+                if not sent:
+                    await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
+                return True, "已导出并发送 HTML 文件", True
+            else:
+                await self._safe_send_text("❌ 导出 HTML 文件失败", stream_id)
+                return False, "导出失败", True
+
+        # 分支 3: 查看状态
         if args == "status":
             omp_path = self._resolve_omp_binary()
             bwrap_path = self._resolve_bwrap_binary()
@@ -487,6 +597,15 @@ class OmpPlugin(MaiBotPlugin):
                 f"{resume_hint}"
             )
             await self._safe_send_text(reply_text, stream_id)
+
+            # 使用 OMP 内置的 --export 功能将结果转换为 HTML 网页文件并发送
+            if self.effective_config.omp.export_html and session_id:
+                html_path = await self._export_session_to_html(session_id)
+                if html_path:
+                    sent = await self._safe_send_file(html_path, stream_id)
+                    if not sent:
+                        await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
+
             return True, f"OMP 任务执行成功 ({round(duration, 2)}s)", True
         else:
             resume_hint = (
