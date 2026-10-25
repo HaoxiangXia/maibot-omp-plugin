@@ -313,6 +313,7 @@ class OmpPlugin(MaiBotPlugin):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(workspace_path),
@@ -320,6 +321,9 @@ class OmpPlugin(MaiBotPlugin):
         except Exception as exc:
             elapsed = time.monotonic() - start_monotonic
             return False, f"启动 OMP 子进程失败: {exc}", elapsed, None
+
+        # 确认子进程已成功生成并在后台运行，再发送启动回执
+        await self._safe_send_text("⏳ OMP 任务已启动，正在沙盒中执行，请稍候...", stream_id)
 
         communicate_task = asyncio.create_task(proc.communicate())
         notified_progress = False
@@ -461,7 +465,6 @@ class OmpPlugin(MaiBotPlugin):
             await self._safe_send_text(err_msg, stream_id)
             return False, "OMP 插件已禁用", True
 
-        await self._safe_send_text("⏳ OMP 任务已启动，正在沙盒中执行，请稍候...", stream_id)
 
         success, output, duration, session_id = await self._run_omp_task(prompt=args, stream_id=stream_id)
         max_len = self.effective_config.omp.max_reply_length
