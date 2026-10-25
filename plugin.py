@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -259,42 +260,68 @@ class OmpPlugin(MaiBotPlugin):
 
         abs_file = str(file_path.resolve())
         file_name = file_path.name
+        clean_grp = str(group_id or "").strip()
+        clean_usr = str(user_id or "").strip()
 
         # 途径 1: QQ / NapCat 原生文件上传 API
-        # OneBot 11 协议中文件不能作为普通消息段发送（否则会被降级为文本 "[file]"），
+        # OneBot 11 协议中文件不能作为普通消息段发送（否则会被 QQ 降级为文本 "[file]"），
         # 必须调用 upload_group_file 或 upload_private_file。
+        # 此外，NapCat 通常运行在 Docker 容器中，宿主机 /home/xiang/MaiBot/data/MaiMBot 映射为容器内 /MaiMBot/data。
+        # 因此我们将文件同步复制一份到共享目录，并传递容器可见路径；若不支持则降级为 base64:// 协议传递。
         if hasattr(self, "_ctx") and self._ctx is not None:
-            clean_grp = str(group_id or "").strip()
-            clean_usr = str(user_id or "").strip()
-            try:
-                if clean_grp and clean_grp.isdigit():
-                    resp = await self.ctx.api.call(
-                        "adapter.napcat.file.upload_group_file",
-                        params={
-                            "group_id": int(clean_grp),
-                            "file": abs_file,
-                            "name": file_name,
-                        },
-                    )
-                    if isinstance(resp, dict) and resp.get("success") is not False:
-                        logger.info(f"已通过 NapCat API 上传群文件: {file_name} -> group {clean_grp}")
-                        return True
-                elif clean_usr and clean_usr.isdigit():
-                    resp = await self.ctx.api.call(
-                        "adapter.napcat.file.upload_private_file",
-                        params={
-                            "user_id": int(clean_usr),
-                            "file": abs_file,
-                            "name": file_name,
-                        },
-                    )
-                    if isinstance(resp, dict) and resp.get("success") is not False:
-                        logger.info(f"已通过 NapCat API 上传私聊文件: {file_name} -> user {clean_usr}")
-                        return True
-            except Exception as exc:
-                logger.debug(f"通过 NapCat 文件上传 API 失败: {exc}")
+            file_candidates: List[str] = []
 
-        # 途径 2: 降级为通用 custom file 段（适配支持文件段的其它 IM 网关）
+            # 1.1 容器共享挂载目录
+            shared_dir = Path("/home/xiang/MaiBot/data/MaiMBot/exports")
+            try:
+                shared_dir.mkdir(parents=True, exist_ok=True)
+                container_file = shared_dir / file_name
+                shutil.copy2(file_path, container_file)
+                file_candidates.append(f"/MaiMBot/data/exports/{file_name}")
+            except Exception as copy_err:
+                logger.debug(f"复制文件到容器共享目录失败: {copy_err}")
+
+            # 1.2 宿主机直连路径（若 NapCat 本地原生运行）
+            file_candidates.append(abs_file)
+
+            # 1.3 Base64 协议（NapCat 内置支持 base64:// 解析，文件 <= 15MB 时可用）
+            try:
+                if file_path.stat().st_size <= 15 * 1024 * 1024:
+                    raw_b64 = base64.b64encode(file_path.read_bytes()).decode("ascii")
+                    file_candidates.append(f"base64://{raw_b64}")
+            except Exception as b64_err:
+                logger.debug(f"读取文件转 Base64 失败: {b64_err}")
+
+            for ref in file_candidates:
+                try:
+                    if clean_grp and clean_grp.isdigit():
+                        resp = await self.ctx.api.call(
+                            "adapter.napcat.file.upload_group_file",
+                            params={
+                                "group_id": int(clean_grp),
+                                "file": ref,
+                                "name": file_name,
+                            },
+                        )
+                        if isinstance(resp, dict) and resp.get("success") is not False:
+                            logger.info(f"已通过 NapCat API 上传群文件: {file_name} -> group {clean_grp}")
+                            return True
+                    elif clean_usr and clean_usr.isdigit():
+                        resp = await self.ctx.api.call(
+                            "adapter.napcat.file.upload_private_file",
+                            params={
+                                "user_id": int(clean_usr),
+                                "file": ref,
+                                "name": file_name,
+                            },
+                        )
+                        if isinstance(resp, dict) and resp.get("success") is not False:
+                            logger.info(f"已通过 NapCat API 上传私聊文件: {file_name} -> user {clean_usr}")
+                            return True
+                except Exception as exc:
+                    logger.debug(f"尝试使用引用 {ref[:40]}... 上传 NapCat 文件失败: {exc}")
+
+        # 途径 2: 降级为通用 custom file 段（适配支持文件段的其它 IM 网关，如 WebUI）
         if hasattr(self, "_ctx") and self._ctx is not None and stream_id:
             try:
                 payload = {
