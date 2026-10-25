@@ -236,27 +236,77 @@ class OmpPlugin(MaiBotPlugin):
             logger.error(f"向聊天流 {stream_id} 发送消息失败: {exc}", exc_info=True)
         return False
 
-    async def _safe_send_file(self, file_path: Path, stream_id: str) -> bool:
-        """安全向指定聊天流发送文件。
+    async def _safe_send_file(
+        self,
+        file_path: Path,
+        stream_id: str,
+        group_id: str = "",
+        user_id: str = "",
+    ) -> bool:
+        """安全向指定聊天流发送 HTML 交互网页文件。
 
         Args:
             file_path: 目标文件路径。
             stream_id: 聊天流标识。
+            group_id: 群号（如果是群聊）。
+            user_id: 用户 QQ 号。
 
         Returns:
             bool: 发送是否成功。
         """
-        if not stream_id or not file_path.is_file():
+        if not file_path.is_file():
             return False
-        try:
-            if hasattr(self, "_ctx") and self._ctx is not None:
+
+        abs_file = str(file_path.resolve())
+        file_name = file_path.name
+
+        # 途径 1: QQ / NapCat 原生文件上传 API
+        # OneBot 11 协议中文件不能作为普通消息段发送（否则会被降级为文本 "[file]"），
+        # 必须调用 upload_group_file 或 upload_private_file。
+        if hasattr(self, "_ctx") and self._ctx is not None:
+            clean_grp = str(group_id or "").strip()
+            clean_usr = str(user_id or "").strip()
+            try:
+                if clean_grp and clean_grp.isdigit():
+                    resp = await self.ctx.api.call(
+                        "adapter.napcat.file.upload_group_file",
+                        params={
+                            "group_id": int(clean_grp),
+                            "file": abs_file,
+                            "name": file_name,
+                        },
+                    )
+                    if isinstance(resp, dict) and resp.get("success") is not False:
+                        logger.info(f"已通过 NapCat API 上传群文件: {file_name} -> group {clean_grp}")
+                        return True
+                elif clean_usr and clean_usr.isdigit():
+                    resp = await self.ctx.api.call(
+                        "adapter.napcat.file.upload_private_file",
+                        params={
+                            "user_id": int(clean_usr),
+                            "file": abs_file,
+                            "name": file_name,
+                        },
+                    )
+                    if isinstance(resp, dict) and resp.get("success") is not False:
+                        logger.info(f"已通过 NapCat API 上传私聊文件: {file_name} -> user {clean_usr}")
+                        return True
+            except Exception as exc:
+                logger.debug(f"通过 NapCat 文件上传 API 失败: {exc}")
+
+        # 途径 2: 降级为通用 custom file 段（适配支持文件段的其它 IM 网关）
+        if hasattr(self, "_ctx") and self._ctx is not None and stream_id:
+            try:
                 payload = {
-                    "file": str(file_path.resolve()),
-                    "name": file_path.name,
+                    "file": abs_file,
+                    "name": file_name,
                 }
-                return bool(await self.ctx.send.custom("file", payload, stream_id))
-        except Exception as exc:
-            logger.error(f"向聊天流 {stream_id} 发送文件失败: {exc}", exc_info=True)
+                res = await self.ctx.send.custom("file", payload, stream_id)
+                if res:
+                    return True
+            except Exception as exc:
+                logger.debug(f"通用 send.custom 文件发送失败: {exc}")
+
         return False
 
     async def _export_session_to_html(self, session_id: str) -> Optional[Path]:
@@ -492,6 +542,9 @@ class OmpPlugin(MaiBotPlugin):
         if not isinstance(matched_groups, dict):
             matched_groups = {}
 
+        raw_group_id = str(kwargs.get("group_id") or "").strip()
+        raw_user_id = str(kwargs.get("user_id") or "").strip()
+
         args = str(matched_groups.get("args") or "").strip()
         if not args:
             raw_text = str(kwargs.get("text") or "").strip()
@@ -527,7 +580,9 @@ class OmpPlugin(MaiBotPlugin):
             latest_id = stem.split("_")[-1] if "_" in stem else stem
             html_path = await self._export_session_to_html(latest_id)
             if html_path:
-                sent = await self._safe_send_file(html_path, stream_id)
+                sent = await self._safe_send_file(
+                    html_path, stream_id, group_id=raw_group_id, user_id=raw_user_id
+                )
                 if not sent:
                     await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
                 return True, "已导出并发送 HTML 文件", True
@@ -602,7 +657,9 @@ class OmpPlugin(MaiBotPlugin):
             if self.effective_config.omp.export_html and session_id:
                 html_path = await self._export_session_to_html(session_id)
                 if html_path:
-                    sent = await self._safe_send_file(html_path, stream_id)
+                    sent = await self._safe_send_file(
+                        html_path, stream_id, group_id=raw_group_id, user_id=raw_user_id
+                    )
                     if not sent:
                         await self._safe_send_text(f"📄 交互网页已生成：{html_path}", stream_id)
 

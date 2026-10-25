@@ -24,6 +24,7 @@
   "capabilities": [
     "send.text",
     "send.custom",
+    "api.call",
     "config.get"
   ],
   "i18n": {
