@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "github.haoxiangxia.omp-agent",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "name": "OMP Agent 插件",
-  "description": "提供 /omp 显式指令直通调用宿主机 OMP 执行代码与开发任务，内置沙盒隔离与 HTML 交互网页发送",
+  "description": "提供 /omp 显式指令直通调用宿主机 OMP 执行代码与开发任务，内置 RPC-UI 流式双向交互、Bubblewrap 沙盒隔离、原生扩展状态监听与 QQ 原生卡片回传",
   "author": {
     "name": "HaoxiangXia",
     "url": "https://github.com/HaoxiangXia"
