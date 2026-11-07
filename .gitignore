@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 config.toml
 config_back/
+logs/
 .pytest_cache/
 .venv/
 venv/
