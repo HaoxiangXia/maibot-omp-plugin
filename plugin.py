@@ -1099,6 +1099,15 @@ class OmpAgentPlugin(MaiBotPlugin):
         cmd: List[str] = []
         env = os.environ.copy()
         env["MAIBOT_OMP_INTERNAL"] = "1"
+        proxy_env_keys: Tuple[str, ...] = (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "PI_PROXY",
+        )
         if proxy_url:
             env["HTTP_PROXY"] = proxy_url
             env["HTTPS_PROXY"] = proxy_url
@@ -1106,8 +1115,13 @@ class OmpAgentPlugin(MaiBotPlugin):
             env["http_proxy"] = proxy_url
             env["https_proxy"] = proxy_url
             env["all_proxy"] = proxy_url
+            env["PI_PROXY"] = proxy_url
             env["NO_PROXY"] = "127.0.0.1,localhost,::1"
             env["no_proxy"] = "127.0.0.1,localhost,::1"
+        else:
+            # 未指定代理时主动清理继承自宿主环境的代理变量（包括 OMP 特有的 PI_PROXY），防止死代理导致网络被拒
+            for key in proxy_env_keys:
+                env.pop(key, None)
 
         if use_sandbox and bwrap_binary:
             cmd.extend([
@@ -1139,9 +1153,13 @@ class OmpAgentPlugin(MaiBotPlugin):
                     "--setenv", "https_proxy", proxy_url,
                     "--setenv", "ALL_PROXY", proxy_url,
                     "--setenv", "all_proxy", proxy_url,
+                    "--setenv", "PI_PROXY", proxy_url,
                     "--setenv", "NO_PROXY", "127.0.0.1,localhost,::1",
                     "--setenv", "no_proxy", "127.0.0.1,localhost,::1",
                 ])
+            else:
+                for key in proxy_env_keys:
+                    cmd.extend(["--unsetenv", key])
             cmd.extend(["--setenv", "MAIBOT_OMP_INTERNAL", "1"])
             cmd.extend([omp_binary, "--mode", "rpc-ui"])
         else:
