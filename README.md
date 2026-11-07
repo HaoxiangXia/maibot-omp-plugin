@@ -36,13 +36,24 @@
 - **任务生命周期控制**：随时可通过 `/omp stop` 优雅软中断（RPC `abort`）正在运行的任务并复位沙盒。
 - **免 TUN 模式代理直通**：支持配置 HTTP/SOCKS 代理地址（默认 `http://127.0.0.1:7897`），沙盒自动注入代理环境变量，无需开启 Linux TUN 虚拟网卡即可畅连 Google Gemini 与 OpenAI GPT。
 
+## 兼容性
+
+- **MaiBot 主程序**：`1.3.0` – `1.4.x`。manifest 的 `max_version = 1.4.99` 是插件市场要求的三段式写法，表示 1.4 全系列。
+- **插件 SDK**：`2.0.0` 及以上（`2.x`）。
+- **宿主机**：需安装 [OMP](https://github.com/oh-my-pi/oh-my-pi) 与 `bwrap`（Bubblewrap）。
+- **许可证**：GPL-3.0-or-later。
+
 ## 安装
 1. 将本仓库克隆或下载到 MaiBot 的 `plugins/` 目录下：
    ```bash
    git clone https://github.com/HaoxiangXia/maibot-omp-plugin.git plugins/maibot_omp_plugin
    ```
-2. 重启 MaiBot（或在 WebUI 插件管理中重载），插件 `github.haoxiangxia.omp-agent` 会自动加载。
-3. 依赖：宿主机需安装 [OMP](https://github.com/oh-my-pi/oh-my-pi) 与 `bwrap`（Bubblewrap）。
+2. 复制配置模板并按需修改（`config.toml` 已被 `.gitignore` 忽略，不会进入版本控制）：
+   ```bash
+   cp plugins/maibot_omp_plugin/config.example.toml plugins/maibot_omp_plugin/config.toml
+   ```
+3. 重启 MaiBot（或在 WebUI 插件管理中重载），插件 `github.haoxiangxia.omp-agent` 会自动加载。
+4. 依赖：宿主机需安装 [OMP](https://github.com/oh-my-pi/oh-my-pi) 与 `bwrap`（Bubblewrap）。
 
 ## 指令使用方法
 - `/omp <任务内容>`：在隔离沙盒中向宿主机 OMP 下发执行任务，通过 RPC 结构化驱动。
@@ -55,7 +66,7 @@
 - `/omp help`：以合并转发卡片查看帮助指南与常用示例。
 
 ## 配置项
-可通过 WebUI 插件管理或 `config.toml` 进行 5 个卡片的模块化配置：
+可通过 WebUI 插件管理或 `config.toml` 进行 5 个卡片的模块化配置；`config.example.toml` 是带注释的模板，初次部署直接复制即可：
 - **`[plugin]` (基础设置)**：
   - `enabled` (bool): 插件全局开关，默认 `true`
 - **`[runtime]` (运行环境与模型)**：
@@ -80,5 +91,5 @@
 - **`[notification]` (外部任务监听与通知)**：
   - `watch_external_sessions` (bool): 是否后台监听非 Bot 启动的外部 OMP 任务，默认 `true`
   - `bridge_socket_path` (str): Unix Domain Socket 监听路径，默认 `/tmp/maibot-omp-bridge.sock`
-  - `notify_user_id` (str): 外部 OMP 任务关注事件推送的目标 QQ 号（私聊推送，默认留空不推送）
+  - `notify_user_id` (str): 外部 OMP 任务关注事件推送的目标 QQ 号（私聊推送，留空则不推送；模板默认留空，请按需填写）
   - `export_external_html` (bool): 外部任务完成后是否自动导出 HTML 网页文件并私聊推送，默认 `false`
