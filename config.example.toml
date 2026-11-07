@@ -1,0 +1,40 @@
+# OMP Agent 插件配置示例
+# 复制本文件为 config.toml 后按需修改；config.toml 已被 .gitignore 忽略，不会进入版本控制。
+# 各配置项含义见 README.md「配置项」章节。
+
+[plugin]
+enabled = true
+config_version = "1.2.0"
+
+[runtime]
+# omp 可执行文件的绝对路径，可用 `which omp` 查询
+omp_path = "/home/xiang/.bun/bin/omp"
+default_model = "gemini-3.8-flash"
+# 沙盒内唯一可写工作区，需确保 MaiBot 进程对其有读写权限
+default_cwd = "/home/xiang/MaiBot/data/omp_workspace"
+
+[security]
+use_sandbox = true
+bwrap_path = "/usr/bin/bwrap"
+# 留空表示不使用代理；免 TUN 模式可填 http://127.0.0.1:7897
+proxy_url = ""
+
+[execution]
+auto_approve = true
+save_session = true
+timeout_seconds = 1200
+progress_notify_seconds = 300
+max_reply_length = 500
+export_html = true
+tool_hang_timeout_seconds = 300
+idle_timeout_seconds = 300
+max_total_seconds = 3600
+max_tool_calls = 100
+ask_timeout_seconds = 120
+
+[notification]
+watch_external_sessions = true
+# 外部 OMP 任务事件推送的目标 QQ 号；留空表示不推送
+notify_user_id = ""
+export_external_html = false
+bridge_socket_path = "/tmp/maibot-omp-bridge.sock"
