@@ -1,4 +1,4 @@
-# OMP Agent 插件 (github.haoxiangxia.omp-agent) v1.2.0
+# OMP Agent 插件 (github.haoxiangxia.omp-agent) v1.2.1
 
 通过显式指令为用户提供调用宿主机 OMP (AI 编程与系统 Harness) 的能力，内置 Bubblewrap 内核沙盒强隔离、工作空间目录级 Session 隔离、全新 Ephemeral RPC-UI 流式双向交互、产出物智能分流回传、独占并发拦截、基于原生 TS 扩展的外部 OMP 运行状态监听与 WebUI 全中文配置。
 
@@ -42,18 +42,6 @@
 - **插件 SDK**：`2.0.0` 及以上（`2.x`）。
 - **宿主机**：需安装 [OMP](https://github.com/oh-my-pi/oh-my-pi) 与 `bwrap`（Bubblewrap）。
 - **许可证**：GPL-3.0-or-later。
-
-## 安装
-1. 将本仓库克隆或下载到 MaiBot 的 `plugins/` 目录下：
-   ```bash
-   git clone https://github.com/HaoxiangXia/maibot-omp-plugin.git plugins/maibot_omp_plugin
-   ```
-2. 复制配置模板并按需修改（`config.toml` 已被 `.gitignore` 忽略，不会进入版本控制）：
-   ```bash
-   cp plugins/maibot_omp_plugin/config.example.toml plugins/maibot_omp_plugin/config.toml
-   ```
-3. 重启 MaiBot（或在 WebUI 插件管理中重载），插件 `github.haoxiangxia.omp-agent` 会自动加载。
-4. 依赖：宿主机需安装 [OMP](https://github.com/oh-my-pi/oh-my-pi) 与 `bwrap`（Bubblewrap）。
 
 ## 指令使用方法
 - `/omp <任务内容>`：在隔离沙盒中向宿主机 OMP 下发执行任务，通过 RPC 结构化驱动。
